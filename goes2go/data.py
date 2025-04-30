@@ -154,6 +154,7 @@ def _goes_file_df(satellite, product, start, end, bands=None, refresh=True, igno
     # Build a table of the files
     # --------------------------
     df = pd.DataFrame(files, columns=["file"])
+    df.drop(index=df.index[~df["file"].str.contains(".nc")],inplace=True)
     df[["product_mode", "satellite", "start", "end", "creation"]] = (
         df["file"].str.rsplit("_", expand=True, n=5).loc[:, 1:]
     )
