@@ -15,7 +15,7 @@ import pandas as pd
 import s3fs
 
 from goes2go import config
-from goes2go.data import _goes_file_df, goes_latest, goes_nearesttime, goes_timerange, goes_single_point_timerange
+from goes2go.data import _goes_file_df, goes_latest, goes_nearesttime, goes_timerange, goes_single_point_timerange, _product
 
 log = logging.getLogger(__name__)
 
@@ -32,12 +32,6 @@ product_table = pd.read_csv(
 )
 product_table.index = product_table.index.str.strip()
 product_table["description"] = product_table.description.str.strip()
-
-
-# Assume goes17 and goes18 have same products as goes16
-_product = {i.split("/")[-1] for i in fs.ls("noaa-goes16")}
-_product = set(filter(lambda x: x.split(".")[-1] not in ["pdf", "html"], _product))
-_product
 
 # you can be unspecific and request any mesoscale domain (M),
 # or by number (M1, M2)
@@ -96,7 +90,7 @@ class GOES:
         else:
             self.bands = bands
 
-        if self.product.startswith("ABI") and self.product in _product:
+        if self.product.startswith("ABI") and self.product in _product[self.satellite]:
             # Sometimes the user might inavertantly give the domain
             # in the product name.
             self.domain = self.product[-1]
@@ -140,7 +134,7 @@ class GOES:
             elif self.domain is not None:
                 if self.domain in _domains:
                     self.product = self.product + re.sub("[0-9]", "", self.domain)
-                    if self.product not in _product:
+                    if self.product not in _product[self.satellite]:
                         raise ValueError(f"{self.product} is not a valid product.")
                 else:
                     raise ValueError(
@@ -150,7 +144,7 @@ class GOES:
             if self.domain is not None:
                 log.warning("domain argument is ignored for non-ABI products")
 
-        if self.product in _product:
+        if self.product in _product[self.satellite]:
             self.description = product_table.loc[self.product].description
         else:
             raise ValueError(f"{self.product} is not an available product.")

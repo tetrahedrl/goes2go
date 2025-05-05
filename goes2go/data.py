@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 import s3fs
 import xarray as xr
+import xarrayfits
 
 from goes2go.tools import lat_lon_to_scan_angles
 
@@ -45,23 +46,82 @@ _satellite = {
     "noaa-goes19": [19, "19", "G19", "EAST", "GOES19"],
 }
 
+_bucket = {
+    "noaa-goes16": ["noaa-goes16"],
+    "noaa-goes17": ["noaa-goes17"],
+    "noaa-goes18": ["noaa-goes18"],
+    "noaa-goes19": ["noaa-goes19","noaa-nesdis-swfo-ccor-1-pds/SWFO/GOES-19/CCOR-1"],
+}
+
+_goes_pathspec = "{bucket}/{product}/{DATE:%Y/%j/%H/}"
+_swfo_pathspec = "{bucket}/{product}/{DATE:%Y/%m/%d/}"
+_pathspec = {
+    "noaa-goes16": _goes_pathspec,
+    "noaa-goes17": _goes_pathspec,
+    "noaa-goes18": _goes_pathspec,
+    "noaa-goes19": _goes_pathspec,
+    "noaa-nesdis-swfo-ccor-1-pds/SWFO/GOES-19/CCOR-1": _swfo_pathspec
+}
+
+_goes_datespec = "%Y%j%H%M%S%f"
+_swfo_datespec = "%Y%m%dT%H%M%S"
+_datespec = {
+    "noaa-goes16": _goes_datespec,
+    "noaa-goes17": _goes_datespec,
+    "noaa-goes18": _goes_datespec,
+    "noaa-goes19": _goes_datespec,
+    "noaa-nesdis-swfo-ccor-1-pds/SWFO/GOES-19/CCOR-1": _swfo_datespec
+}
+
+_goes_namespec = r".*/(?P<product>[^/]*)_s(?P<start>\d{14})_e(?P<end>\d{14})_c(?P<creation>\d{14})\.(?P<filetype>.*)"
+_swfo_namespec = r".*/(?P<product>[^/]*)_(?P<start>\d{8}T\d{6})_(?P<version>V\d\d)_(?P<sucode>.{2})\.(?P<filetype>.*)"
+_namespec = {
+    "noaa-goes16": _goes_namespec,
+    "noaa-goes17": _goes_namespec,
+    "noaa-goes18": _goes_namespec,
+    "noaa-goes19": _goes_namespec,
+    "noaa-nesdis-swfo-ccor-1-pds/SWFO/GOES-19/CCOR-1": _swfo_namespec
+}
+
+_reader = {
+    "fits":lambda x: list(xarrayfits.xds_from_fits(x))[0],
+    "nc":xr.load_dataset
+}
+
 _domain = {
     "C": ["CONUS"],
     "F": ["FULL", "FULLDISK", "FULL DISK"],
     "M": ["MESOSCALE", "M1", "M2"],
 }
 
-_product = {
-    # Assume goes17 and goes18 have same products as goes16
-    i.split("/")[-1]: []
-    for i in fs.ls("noaa-goes16")
+_bucket_product = {
+    s:
+    {
+        b:
+        [
+            i.split("/")[-1]
+            for i in fs.ls(b)
+        ]
+        for b in _bucket[s]
+    }
+    for s in _satellite
 }
-_product.pop("index.html", None)
-_product["GLM-L2-LCFA"] = ["GLM"]
-_product["ABI-L2-MCMIPC"] = ["ABIC"]
-_product["ABI-L2-MCMIPF"] = ["ABIF"]
-_product["ABI-L2-MCMIPM"] = ["ABIM"]
 
+_product = {
+    s:
+    {
+        i.split("/")[-1]: []
+        for i in sum([fs.ls(b) for b in _bucket[s]],[])
+    }
+    for s in _satellite
+}
+
+for prodd in _product.values():
+    prodd.pop("index.html", None)
+    prodd["GLM-L2-LCFA"] = ["GLM"]
+    prodd["ABI-L2-MCMIPC"] = ["ABIC"]
+    prodd["ABI-L2-MCMIPF"] = ["ABIF"]
+    prodd["ABI-L2-MCMIPM"] = ["ABIM"]
 
 def _check_param_inputs(**params):
     """Check the input parameters for correct name or alias.
@@ -105,12 +165,12 @@ def _check_param_inputs(**params):
         domain = None
 
     ## Determine the Product
-    if product not in _product:
+    if product not in _product[satellite]:
         for key, aliases in _product.items():
             if product.upper() in aliases:
                 product = key
-    if product not in _product:
-        raise ValueError(f"product must be one of {list(_product .keys())} or an alias {list(_product .values())}")
+    if product not in _product[satellite]:
+        raise ValueError(f"product must be one of {list(_product[satellite].keys())} or an alias {list(_product[satellite].values())}")
 
     return satellite, product, domain
 
@@ -139,9 +199,16 @@ def _goes_file_df(satellite, product, start, end, bands=None, refresh=True, igno
 
     # List all files for each date
     # ----------------------------
+    bucket = None
+    for b in _bucket[satellite]:
+        if product in _bucket_product[satellite][b]:
+            bucket = b
+    if bucket is None:
+        raise FileNotFoundError(f"Product {product} not in any bucket ({_bucket[satellite]})")
     files = []
     for DATE in DATES:
-        path = f"{satellite}/{product}/{DATE:%Y/%j/%H/}"
+        path = _pathspec[bucket].format(bucket=bucket,product=product,DATE=DATE)
+        # path = f"{satellite}/{product}/{DATE:%Y/%j/%H/}"
         if ignore_missing is True:
             try:
                 files += fs.ls(path, refresh=refresh)
@@ -154,10 +221,17 @@ def _goes_file_df(satellite, product, start, end, bands=None, refresh=True, igno
     # Build a table of the files
     # --------------------------
     df = pd.DataFrame(files, columns=["file"])
-    df.drop(index=df.index[~df["file"].str.contains(".nc")],inplace=True)
-    df[["product_mode", "satellite", "start", "end", "creation"]] = (
-        df["file"].str.rsplit("_", expand=True, n=5).loc[:, 1:]
-    )
+    df['short_file'] = df.file.str.split('/',expand=True).iloc[:,-1]
+    df = df.drop_duplicates('short_file',ignore_index=True)
+    if np.any(df['file'].str.contains(".nc")):
+        df.drop(index=df.index[~df["file"].str.contains(".nc")],inplace=True)
+    df = df.assign(**df['file'].str.extract(_namespec[bucket]))
+    if 'sucode' in df.columns:
+        df = df[df.sucode == 'NC']
+    if 'end' not in df.columns:
+        df['end'] = df['start']
+    if 'creation' not in df.columns:
+        df['creation'] = df['start']
 
     # Todo: this could use some clean up !
     if product.startswith("ABI"):
@@ -182,9 +256,9 @@ def _goes_file_df(satellite, product, start, end, bands=None, refresh=True, igno
     # Filter files by requested time range
     # ------------------------------------
     # Convert filename datetime string to datetime object
-    df["start"] = pd.to_datetime(df.start, format="s%Y%j%H%M%S%f")
-    df["end"] = pd.to_datetime(df.end, format="e%Y%j%H%M%S%f")
-    df["creation"] = pd.to_datetime(df.creation, format="c%Y%j%H%M%S%f.nc")
+    df["start"] = pd.to_datetime(df.start, format=_datespec[bucket])
+    df["end"] = pd.to_datetime(df.end, format=_datespec[bucket])
+    df["creation"] = pd.to_datetime(df.creation, format=_datespec[bucket])
 
     # Filter by files within the requested time range
     df = df.loc[df.start >= start].loc[df.end <= end].reset_index(drop=True)
@@ -225,7 +299,7 @@ def _download(df, save_dir, overwrite, max_threads=10, verbose=False):
     )
 
 
-def _as_xarray_MP(src, save_dir, i=None, n=None, verbose=True):
+def _as_xarray_MP(src, filetype, save_dir, i=None, n=None, verbose=True):
     """Open a file as a xarray.Dataset -- a multiprocessing helper."""
     # File destination
     local_copy = Path(save_dir) / src
@@ -236,18 +310,19 @@ def _as_xarray_MP(src, save_dir, i=None, n=None, verbose=True):
                 f"\r📖💽 Reading ({i:,}/{n:,}) file from LOCAL COPY [{local_copy}].",
                 end=" ",
             )
-        with open(local_copy, "rb") as f:
-            ds = xr.load_dataset(f)
-    else:
-        if verbose:
-            print(
-                f"\r📖☁ Reading ({i:,}/{n:,}) file from AWS to MEMORY [{src}].", end=" "
-            )
-        with fs.open(src, "rb") as f:
-            ds = xr.load_dataset(f)
+        ds = _reader[filetype](str(local_copy))
+    #else:
+    #    if verbose:
+    #        print(
+    #            f"\r📖☁ Reading ({i:,}/{n:,}) file from AWS to MEMORY [{src}].", end=" "
+    #        )
+    #    with fs.open(src, "rb") as f:
+    #        ds = _reader[filetype](f)
+
 
     # Turn some attributes to coordinates so they will be preserved
     # when we concat multiple GOES DataSets together.
+    """
     attr2coord = [
         "dataset_name",
         "date_created",
@@ -259,7 +334,7 @@ def _as_xarray_MP(src, save_dir, i=None, n=None, verbose=True):
             ds.coords[i] = ds.attrs.pop(i)
 
     ds["filename"] = src
-
+    """
     return ds
 
 
@@ -287,7 +362,7 @@ def _as_xarray(df, **params):
         print("🛸 No data....🌌")
     elif n == 1:
         # If we only have one file, we don't need multiprocessing
-        ds = _as_xarray_MP(df.iloc[0].file, save_dir, 1, 1, verbose)
+        ds = _as_xarray_MP(df.iloc[0].file, df.iloc[0].filetype, save_dir, 1, 1, verbose)
     else:
         # Use Multiprocessing to read multiple files.
         if max_cpus is None:
@@ -295,7 +370,7 @@ def _as_xarray(df, **params):
         cpus = np.minimum(multiprocessing.cpu_count(), max_cpus)
         cpus = np.minimum(cpus, n)
 
-        inputs = [(src, save_dir, i, n) for i, src in enumerate(df.file, start=1)]
+        inputs = [(src, filetype, save_dir, i, n) for i, (src,filetype) in enumerate(zip(df.file,df.filetype), start=1)]
 
         with multiprocessing.Pool(cpus) as p:
             results = p.starmap(_as_xarray_MP, inputs)
@@ -303,15 +378,16 @@ def _as_xarray(df, **params):
             p.join()
 
         # Need some work to concat the datasets
-        if df.attrs["product"].startswith("ABI"):
-            print("concatenate Datasets", end="")
-            ds = xr.concat(results, dim="t")
-        else:
-            ds = results
+        #if df.attrs["product"].startswith("ABI"):
+        #    print("concatenate Datasets", end="")
+        #    ds = xr.concat(results, dim="t")
+        #else:
+        #    ds = results
+        ds = results
 
     if verbose:
         print(f"\r{'':1000}\r📚 Finished reading [{n}] files into xarray.Dataset.")
-    ds.attrs["path"] = df.file.to_list()
+    #ds.attrs["path"] = df.file.to_list()
     return ds
 
 
@@ -753,7 +829,6 @@ def goes_nearesttime(
     end = attime + within
 
     df = _goes_file_df(satellite, product, start, end, bands=bands, refresh=s3_refresh, ignore_missing=ignore_missing)
-
     # return df, start, end, attime
 
     # Filter for specific mesoscale domain
@@ -761,12 +836,14 @@ def goes_nearesttime(
         df = df[df["file"].str.contains(f"{domain.upper()}-M")]
 
     # Get row that matches the nearest time
+    df['file_short'] = df.file.str.split('/',expand=True).iloc[:,-1]
     df = df.sort_values("start")
-    df = df.set_index(df.start)
+    df = df.set_index(df.start,drop=True)
     unique_times_index = df.index.unique()
     nearest_time_index = unique_times_index.get_indexer([attime], method="nearest")
     nearest_time = unique_times_index[nearest_time_index]
     df = df.loc[nearest_time]
+
     df = df.reset_index(drop=True)
 
     n = len(df.file)
